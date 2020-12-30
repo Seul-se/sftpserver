@@ -21,56 +21,63 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.math.BigInteger;
-import java.nio.charset.Charset;
+import java.net.URL;
 import java.nio.file.FileSystem;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.PosixFilePermission;
+import java.security.Principal;
 import java.security.PublicKey;
-import java.security.interfaces.DSAPublicKey;
-import java.security.interfaces.RSAPublicKey;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Collections;
+import java.util.List;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
-import javax.xml.bind.DatatypeConverter;
-
-import org.apache.mina.core.buffer.IoBuffer;
-import org.apache.sshd.common.Factory;
 import org.apache.sshd.common.NamedFactory;
+import org.apache.sshd.common.NamedResource;
 import org.apache.sshd.common.PropertyResolver;
 import org.apache.sshd.common.PropertyResolverUtils;
-import org.apache.sshd.common.channel.Channel;
+import org.apache.sshd.common.cipher.BuiltinCiphers;
 import org.apache.sshd.common.compression.BuiltinCompressions;
 import org.apache.sshd.common.compression.Compression;
+import org.apache.sshd.common.config.SshConfigFileReader;
 import org.apache.sshd.common.config.keys.KeyUtils;
+import org.apache.sshd.common.config.keys.PublicKeyEntry;
 import org.apache.sshd.common.file.FileSystemFactory;
 import org.apache.sshd.common.file.root.RootedFileSystemProvider;
+import org.apache.sshd.common.kex.BuiltinDHFactories;
 import org.apache.sshd.common.mac.BuiltinMacs;
-import org.apache.sshd.common.mac.Mac;
-import org.apache.sshd.common.session.Session;
-import org.apache.sshd.common.util.GenericUtils;
-import org.apache.sshd.common.util.SecurityUtils;
-import org.apache.sshd.server.Command;
+import org.apache.sshd.common.session.SessionContext;
+import org.apache.sshd.common.session.SessionHeartbeatController.HeartbeatType;
+import org.apache.sshd.common.util.security.SecurityUtils;
 import org.apache.sshd.server.Environment;
 import org.apache.sshd.server.ExitCallback;
+import org.apache.sshd.server.ServerBuilder;
 import org.apache.sshd.server.ServerFactoryManager;
 import org.apache.sshd.server.SshServer;
 import org.apache.sshd.server.auth.password.PasswordAuthenticator;
+import org.apache.sshd.server.auth.pubkey.CachingPublicKeyAuthenticator;
 import org.apache.sshd.server.auth.pubkey.PublickeyAuthenticator;
+import org.apache.sshd.server.channel.ChannelSession;
 import org.apache.sshd.server.channel.ChannelSessionFactory;
+import org.apache.sshd.server.command.Command;
+import org.apache.sshd.server.kex.Moduli;
 import org.apache.sshd.server.keyprovider.AbstractGeneratorHostKeyProvider;
 import org.apache.sshd.server.keyprovider.SimpleGeneratorHostKeyProvider;
 import org.apache.sshd.server.scp.ScpCommandFactory;
 import org.apache.sshd.server.session.ServerSession;
-import org.apache.sshd.server.subsystem.sftp.SftpEventListener;
-import org.apache.sshd.server.subsystem.sftp.SftpSubsystem;
+import org.apache.sshd.server.shell.ShellFactory;
+import org.apache.sshd.server.subsystem.sftp.SftpFileSystemAccessor;
 import org.apache.sshd.server.subsystem.sftp.SftpSubsystemFactory;
+import org.apache.sshd.server.subsystem.sftp.SftpSubsystemProxy;
 import org.javastack.sftpserver.readonly.ReadOnlyRootedFileSystemProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 
 /**
  * SFTP Server
@@ -86,6 +93,7 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 	private static final Logger LOG = LoggerFactory.getLogger(Server.class);
 	private Config db;
 	private SshServer sshd;
+	private ServiceLogger logger;
 	private volatile boolean running = true;
 
 	public static void main(final String[] args) {
@@ -93,13 +101,24 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 	}
 
 	protected void setupFactories() {
-		final CustomSftpSubsystemFactory sftpSubsys = new CustomSftpSubsystemFactory();
-		sshd.setSubsystemFactories(Arrays.<NamedFactory<Command>>asList(sftpSubsys));
-		sshd.setMacFactories(Arrays.<NamedFactory<Mac>>asList( //
-				BuiltinMacs.hmacsha512, //
-				BuiltinMacs.hmacsha256, //
-				BuiltinMacs.hmacsha1));
-		sshd.setChannelFactories(Arrays.<NamedFactory<Channel>>asList(ChannelSessionFactory.INSTANCE));
+		final SftpSubsystemFactory sftpSubsys = new SftpSubsystemFactory.Builder()
+				.withFileSystemAccessor(new CustomSftpFileSystemAccessor()).build();
+		// Request logger
+		sftpSubsys.addSftpEventListener(logger);
+		// Session logger
+		sshd.addSessionListener(logger);
+		// org.apache.sshd.common.BaseBuilder
+		sshd.setSubsystemFactories(Collections.singletonList(sftpSubsys));
+		sshd.setChannelFactories(Collections.singletonList(ChannelSessionFactory.INSTANCE));
+		SshConfigFileReader.configureKeyExchanges(sshd, //
+				db.getKexAlgorithms(), //
+				true, ServerBuilder.DH2KEX, true);
+		SshConfigFileReader.configureCiphers(sshd, //
+				db.getCiphers(), //
+				true, true);
+		SshConfigFileReader.configureMacs(sshd, //
+				db.getMacs(), //
+				true, true);
 	}
 
 	protected void setupDummyShell(final boolean enable) {
@@ -109,9 +128,9 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 	protected void setupKeyPair() {
 		final AbstractGeneratorHostKeyProvider provider;
 		if (SecurityUtils.isBouncyCastleRegistered()) {
-			provider = SecurityUtils.createGeneratorHostKeyProvider(new File(HOSTKEY_FILE_PEM).toPath());
+			provider = SecurityUtils.createGeneratorHostKeyProvider(Paths.get(HOSTKEY_FILE_PEM));
 		} else {
-			provider = new SimpleGeneratorHostKeyProvider(new File(HOSTKEY_FILE_SER));
+			provider = new SimpleGeneratorHostKeyProvider(Paths.get(HOSTKEY_FILE_SER));
 		}
 		provider.setAlgorithm(KeyUtils.RSA_ALGORITHM);
 		sshd.setKeyPairProvider(provider);
@@ -120,13 +139,19 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 	protected void setupScp() {
 		sshd.setCommandFactory(new ScpCommandFactory());
 		sshd.setFileSystemFactory(new SecureFileSystemFactory(db));
-		sshd.setTcpipForwardingFilter(null);
+		sshd.setForwardingFilter(null);
 		sshd.setAgentFactory(null);
+		final int hb = db.getHeartbeat();
+		if (hb <= 0) {
+			sshd.disableSessionHeartbeat();
+		} else {
+			sshd.setSessionHeartbeat(HeartbeatType.IGNORE, TimeUnit.SECONDS, hb);
+		}
 	}
 
 	protected void setupAuth() {
 		sshd.setPasswordAuthenticator(this);
-		sshd.setPublickeyAuthenticator(this);
+		sshd.setPublickeyAuthenticator(new CachingPublicKeyAuthenticator(this));
 		sshd.setGSSAuthenticator(null);
 	}
 
@@ -204,7 +229,7 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 		} finally {
 			closeQuietly(is);
 		}
-		return new Config(db);
+		return new Config(db, logger);
 
 	}
 
@@ -221,21 +246,65 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 		PropertyResolverUtils.updateProperty(sshd, ServerFactoryManager.SERVER_IDENTIFICATION, "SSHD");
 	}
 
-	private void setupMaxPacketLength() {
-		final int maxPacketLength = db.getMaxPacketLength();
-		if (maxPacketLength > 1) {
-			PropertyResolverUtils.updateProperty(sshd, SftpSubsystem.MAX_PACKET_LENGTH_PROP, maxPacketLength);
+	/**
+	 * Filter the moduli file contains prime numbers and generators used by
+	 * Diffie-Hellman Group Exchange.
+	 * 
+	 * @see org.apache.sshd.common.kex.BuiltinDHFactories#dhgex256
+	 *      diffie-hellman-group-exchange-sha256
+	 * @see org.apache.sshd.common.kex.BuiltinDHFactories#dhgex
+	 *      diffie-hellman-group-exchange-sha1
+	 * @see org.apache.sshd.server.kex.DHGEXServer
+	 * @see org.apache.sshd.server.kex.Moduli
+	 * @see http://manpages.ubuntu.com/manpages/focal/man5/moduli.5.html
+	 */
+	private void hackModuliDHGEX() {
+		URL srcModuli = null;
+		final File sysLinuxModuli = new File("/etc/ssh/moduli");
+		if (sysLinuxModuli.canRead()) {
+			try {
+				srcModuli = sysLinuxModuli.toURI().toURL();
+				LOG.info("Linux moduli file: " + sysLinuxModuli);
+			} catch (IOException e) {
+			}
+		} else {
+			final String moduliPath = Moduli.INTERNAL_MODULI_RESPATH;
+			srcModuli = Moduli.class.getResource(moduliPath);
+			if (srcModuli == null) {
+				LOG.warn("Missing internal moduli file: " + moduliPath);
+			}
+		}
+		if (srcModuli != null) {
+			final File newModuli = new File(System.getProperty("java.io.tmpdir", "/tmp/"), "moduli.sftpd");
+			if (!newModuli.exists() // create
+					|| (newModuli.length() <= 0) // empty
+					|| (System.currentTimeMillis() - newModuli.lastModified() > TimeUnit.DAYS.toMillis(1))) { // 1day
+				try {
+					LOG.info("Filtering moduli file:" + srcModuli.toExternalForm());
+					final List<String> data = ModuliFilter.filterModuli(srcModuli, //
+							db.getMinSizeDHGEX(), db.getMaxSizeDHGEX());
+					ModuliFilter.writeModuli(newModuli, data);
+				} catch (IOException e) {
+					LOG.error("Error filtering moduli: " + e, e);
+				}
+			}
+			if ((newModuli != null) && newModuli.canRead() && (newModuli.length() > 0)) {
+				LOG.warn("Using moduli file: " + newModuli);
+				PropertyResolverUtils.updateProperty(sshd, ServerFactoryManager.MODULI_URL,
+						newModuli.toURI().toString());
+			}
 		}
 	}
 
 	public void start() {
 		LOG.info("Starting");
+		logger = new ServiceLogger();
 		db = loadConfig();
 		LOG.info("BouncyCastle enabled=" + SecurityUtils.isBouncyCastleRegistered());
 		sshd = SshServer.setUpDefaultServer();
 		LOG.info("SSHD " + sshd.getVersion());
 		hackVersion();
-		setupMaxPacketLength();
+		hackModuliDHGEX();
 		setupFactories();
 		setupKeyPair();
 		setupScp();
@@ -243,14 +312,17 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 		setupSysprops();
 
 		try {
+			final String host = db.getHost();
 			final int port = db.getPort();
 			final boolean enableCompress = db.enableCompress();
 			final boolean enableDummyShell = db.enableDummyShell();
 			setupCompress(enableCompress);
 			setupDummyShell(enableDummyShell);
 			loadHtPasswd();
+			logger.setLogRequest(db.enableLogRequest());
+			sshd.setHost(host);
 			sshd.setPort(port);
-			LOG.info("Listen on port=" + port);
+			LOG.info("Listen on host=" + host + " port=" + port);
 			final Server thisServer = this;
 			Runtime.getRuntime().addShutdownHook(new Thread() {
 				public void run() {
@@ -258,6 +330,12 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 				}
 			});
 			sshd.start();
+			LOG.info("KexAlgorithms(available): " + NamedResource.getNameList(BuiltinDHFactories.VALUES));
+			LOG.info("Ciphers(available): " + NamedResource.getNameList(BuiltinCiphers.VALUES));
+			LOG.info("Macs(available): " + NamedResource.getNameList(BuiltinMacs.VALUES));
+			LOG.info("KexAlgorithms(enabled): " + NamedResource.getNameList(sshd.getKeyExchangeFactories()));
+			LOG.info("Ciphers(enabled): " + NamedResource.getNameList(sshd.getCipherFactories()));
+			LOG.info("Macs(enabled): " + NamedResource.getNameList(sshd.getMacFactories()));
 		} catch (Exception e) {
 			LOG.error("Exception " + e.toString(), e);
 		}
@@ -286,33 +364,82 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 
 	@Override
 	public boolean authenticate(final String username, final String password, final ServerSession session) {
-		LOG.info("Request auth (Password) for username=" + username);
+		logger.authPasswordPreLogin(session, username);
 		if ((username != null) && (password != null)) {
-			return db.checkUserPassword(username, password);
+			return db.checkUserPassword(session, username, password);
 		}
+		logger.authPasswordPostLogin(session, username, Level.ERROR, "[null data][FAIL]");
 		return false;
 	}
 
 	@Override
 	public boolean authenticate(final String username, final PublicKey key, final ServerSession session) {
-		LOG.info("Request auth (PublicKey) for username=" + username);
+		logger.authPublicKeyPreLogin(session, username, key);
 		// File f = new File("/home/" + username + "/.ssh/authorized_keys");
 		if ((username != null) && (key != null)) {
-			return db.checkUserPublicKey(username, key);
+			return db.checkUserPublicKey(session, username, key);
 		}
+		logger.authPublicKeyPostLogin(session, username, key, Level.ERROR, "[null data][FAIL]");
 		return false;
 	}
 
 	// =================== Helper Classes
 
 	static class Config {
+		// @see https://stribika.github.io/2015/01/04/secure-secure-shell.html
+		// @see http://manpages.ubuntu.com/manpages/focal/man5/sshd_config.5.html
+		public static final int DEFAULT_DHGEX_MIN = 2000;
+		public static final int DEFAULT_DHGEX_MAX = 8200;
+		/**
+		 * man 5 sshd_config : KexAlgorithms
+		 * 
+		 * @see org.apache.sshd.common.config.ConfigFileReaderSupport#DEFAULT_KEX_ALGORITHMS
+		 * @see org.apache.sshd.common.kex.BuiltinDHFactories
+		 * @implNote Not all kex/ciphers/macs are supported by sshd-core
+		 */
+		public static final String DEFAULT_KEX_ALGORITHMS = "curve25519-sha256,curve25519-sha256@libssh.org," + //
+				"diffie-hellman-group14-sha256," + //
+				"diffie-hellman-group16-sha512," + //
+				"diffie-hellman-group-exchange-sha256," + //
+				"ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521," + //
+				"diffie-hellman-group14-sha1";
+		/**
+		 * man 5 sshd_config : Ciphers
+		 * 
+		 * @see org.apache.sshd.common.config.ConfigFileReaderSupport#DEFAULT_CIPHERS
+		 * @see org.apache.sshd.common.cipher.BuiltinCiphers
+		 * @implNote Not all kex/ciphers/macs are supported by sshd-core
+		 */
+		public static final String DEFAULT_CIPHERS = "chacha20-poly1305@openssh.com," + //
+				"aes128-ctr,aes192-ctr,aes256-ctr," + //
+				"aes128-gcm@openssh.com,aes256-gcm@openssh.com";
+		/**
+		 * man 5 sshd_config : MACs
+		 * 
+		 * @see org.apache.sshd.common.config.ConfigFileReaderSupport#DEFAULT_MACS
+		 * @see org.apache.sshd.common.mac.BuiltinMacs
+		 * @implNote Not all kex/ciphers/macs are supported by sshd-core
+		 */
+		public static final String DEFAULT_MACS = "umac-64-etm@openssh.com,umac-128-etm@openssh.com," + //
+				"hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com," + //
+				"hmac-sha1-etm@openssh.com," + //
+				"umac-64@openssh.com,umac-128@openssh.com," + //
+				"hmac-sha2-256,hmac-sha2-512,hmac-sha1";
+		public static final int DEFAULT_HEARTBEAT = 0;
 		// Global config
 		public static final String BASE = "sftpserver";
 		public static final String PROP_GLOBAL = BASE + "." + "global";
+		public static final String PROP_HOST = "host";
 		public static final String PROP_PORT = "port";
 		public static final String PROP_COMPRESS = "compress";
 		public static final String PROP_DUMMY_SHELL = "dummyshell";
-		public static final String PROP_MAX_PACKET_LENGTH = "maxPacketLength";
+		public static final String PROP_LOG_REQUEST = "logrequest";
+		public static final String PROP_HEARTBEAT = "heartbeat";
+		public static final String PROP_KEX_ALGORITHMS = "kexalgorithms";
+		public static final String PROP_CIPHERS = "ciphers";
+		public static final String PROP_MACS = "macs";
+		public static final String PROP_DHGEX_MIN = "dhgex-min";
+		public static final String PROP_DHGEX_MAX = "dhgex-max";
 		// HtPasswd config
 		public static final String PROP_HTPASSWD = BASE + "." + "htpasswd";
 		public static final String PROP_HT_HOME = "homedirectory";
@@ -327,9 +454,11 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 		public static final String PROP_ENABLE_WRITE = "writepermission"; // true / false
 
 		private final Properties db;
+		private final ServiceLogger logger;
 
-		public Config(final Properties db) {
+		public Config(final Properties db, final ServiceLogger logger) {
 			this.db = db;
+			this.logger = logger;
 		}
 
 		// Global config
@@ -341,19 +470,20 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 			return Boolean.parseBoolean(getValue(PROP_DUMMY_SHELL));
 		}
 
-		public int getPort() {
-			return Integer.parseInt(getValue(PROP_PORT));
+		public boolean enableLogRequest() {
+			return Boolean.parseBoolean(getValue(PROP_LOG_REQUEST));
 		}
 
-		public int getMaxPacketLength() {
-			final String v = getValue(PROP_MAX_PACKET_LENGTH);
-			if (v == null) {
-				// FIXME: Workaround for BUG in SSHD-CORE
-				// https://issues.apache.org/jira/browse/SSHD-725
-				// https://issues.apache.org/jira/browse/SSHD-728
-				return (64 * 1024); // 64KB
+		public String getHost() {
+			final String host = getValue(PROP_HOST);
+			if ((host == null) || host.isEmpty()) {
+				return "0.0.0.0";
 			}
-			return Integer.parseInt(v);
+			return host;
+		}
+
+		public int getPort() {
+			return Integer.parseInt(getValue(PROP_PORT));
 		}
 
 		private final String getValue(final String key) {
@@ -366,6 +496,58 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 			if (key == null)
 				return null;
 			return db.getProperty(PROP_HTPASSWD + "." + key);
+		}
+
+		public int getHeartbeat() {
+			int hb = DEFAULT_HEARTBEAT;
+			try {
+				hb = Integer.parseInt(getValue(PROP_HEARTBEAT));
+				if (hb < 0) {
+					hb = DEFAULT_HEARTBEAT;
+				}
+			} catch (Exception ign) {
+			}
+			return hb;
+		}
+
+		public String getKexAlgorithms() {
+			final String value = getValue(PROP_KEX_ALGORITHMS);
+			if (value == null) {
+				return DEFAULT_KEX_ALGORITHMS;
+			}
+			return value;
+		}
+
+		public String getCiphers() {
+			final String value = getValue(PROP_CIPHERS);
+			if (value == null) {
+				return DEFAULT_CIPHERS;
+			}
+			return value;
+		}
+
+		public String getMacs() {
+			final String value = getValue(PROP_MACS);
+			if (value == null) {
+				return DEFAULT_MACS;
+			}
+			return value;
+		}
+
+		public int getMinSizeDHGEX() {
+			final String value = getValue(PROP_DHGEX_MIN);
+			if (value == null) {
+				return DEFAULT_DHGEX_MIN;
+			}
+			return Integer.parseInt(value);
+		}
+
+		public int getMaxSizeDHGEX() {
+			final String value = getValue(PROP_DHGEX_MAX);
+			if (value == null) {
+				return DEFAULT_DHGEX_MAX;
+			}
+			return Integer.parseInt(value);
 		}
 
 		// User config
@@ -389,68 +571,73 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 			return Boolean.parseBoolean(value);
 		}
 
-		public boolean checkUserPassword(final String user, final String pwd) {
-			final StringBuilder sb = new StringBuilder(96);
+		public boolean checkUserPassword(final ServerSession session, final String user, final String pwd) {
+			final StringBuilder sb = new StringBuilder(40);
 			boolean traceInfo = false;
 			boolean authOk = false;
-			sb.append("Request auth (Password) for username=").append(user).append(" ");
 			try {
 				if (!isEnabledUser(user)) {
-					sb.append("(user disabled)");
+					sb.append("[user disabled]");
 					return authOk;
 				}
 				final String value = getValue(user, PROP_PWD);
 				if (value == null) {
-					sb.append("(no password)");
+					sb.append("[no password]");
 					return authOk;
 				}
 				final boolean isCrypted = PasswordEncrypt.isCrypted(value);
 				authOk = isCrypted ? PasswordEncrypt.checkPassword(value, pwd) : value.equals(pwd);
-				sb.append(isCrypted ? "(encrypted)" : "(unencrypted)");
+				if (!isCrypted) {
+					sb.append("[config-unencrypted]");
+				}
 				traceInfo = isCrypted;
 			} finally {
-				sb.append(": ").append(authOk ? "OK" : "FAIL");
+				sb.append("[").append(authOk ? "OK" : "FAIL").append("]");
 				if (authOk) {
-					if (traceInfo) {
-						LOG.info(sb.toString());
-					} else {
-						LOG.warn(sb.toString());
-					}
+					logger.authPasswordPostLogin(session, user, (traceInfo ? Level.INFO : Level.WARN), sb.toString());
 				} else {
-					LOG.error(sb.toString());
+					logger.authPasswordPostLogin(session, user, Level.ERROR, sb.toString());
 				}
 			}
 			return authOk;
 		}
 
-		public boolean checkUserPublicKey(final String user, final PublicKey key) {
-			final String encodedKey = PublicKeyHelper.getEncodedPublicKey(key);
-			final StringBuilder sb = new StringBuilder(96);
+		public boolean checkUserPublicKey(final ServerSession session, final String user, final PublicKey key) {
+			final String encodedKey = PublicKeyEntry.toString(key);
+			final StringBuilder sb = new StringBuilder(40);
 			boolean authOk = false;
-			sb.append("Request auth (PublicKey) for username=").append(user);
-			sb.append(" (").append(key.getAlgorithm()).append(")");
 			try {
 				if (!isEnabledUser(user)) {
-					sb.append(" (user disabled)");
+					sb.append("[user disabled]");
 					return authOk;
 				}
 				for (int i = 1; i < 1024; i++) {
 					final String value = getValue(user, PROP_KEY + i);
 					if (value == null) {
 						if (i == 1)
-							sb.append(" (no publickey)");
+							sb.append("[no publickey]");
 						break;
-					} else if (value.equals(encodedKey)) {
-						authOk = true;
-						break;
+					} else {
+						// Strip comment in keys
+						// ssh-rsa AAAAB3NzaC1y...E7uQ== root@host
+						final int s1 = value.indexOf(' ', 0);
+						final int s2 = value.indexOf(' ', s1 + 1);
+						final String ukey = (s2 > s1 ? value.substring(0, s2) : value);
+						if (ukey.equals(encodedKey)) {
+							if ((s1 > 0) && (s1 < s2)) {
+								sb.append("[").append(value.substring(0, s1)).append("]");
+							}
+							authOk = true;
+							break;
+						}
 					}
 				}
 			} finally {
-				sb.append(": ").append(authOk ? "OK" : "FAIL");
+				sb.append("[").append(authOk ? "OK" : "FAIL").append("]");
 				if (authOk) {
-					LOG.info(sb.toString());
+					logger.authPublicKeyPostLogin(session, user, key, Level.INFO, sb.toString());
 				} else {
-					LOG.error(sb.toString());
+					logger.authPublicKeyPostLogin(session, user, key, Level.ERROR, sb.toString());
 				}
 			}
 			return authOk;
@@ -473,9 +660,9 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 		}
 	}
 
-	static class SecureShellFactory implements Factory<Command> {
+	static class SecureShellFactory implements ShellFactory {
 		@Override
-		public Command create() {
+		public Command createShell(final ChannelSession channel) throws IOException {
 			return new SecureShellCommand();
 		}
 	}
@@ -503,7 +690,7 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 		}
 
 		@Override
-		public void start(final Environment env) throws IOException {
+		public void start(final ChannelSession channel, final Environment env) throws IOException {
 			if (err != null) {
 				err.write("shell not allowed\r\n".getBytes("ISO-8859-1"));
 				err.flush();
@@ -513,34 +700,51 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 		}
 
 		@Override
-		public void destroy() {
+		public void destroy(final ChannelSession channel) {
 		}
 	}
 
-	static class CustomSftpSubsystemFactory extends SftpSubsystemFactory {
+	static class CustomSftpFileSystemAccessor implements SftpFileSystemAccessor {
 		@Override
-		public Command create() {
-			final SftpSubsystem subsystem = new SftpSubsystem(getExecutorService(), isShutdownOnExit(),
-					getUnsupportedAttributePolicy()) {
-				@Override
-				protected void setFileAttribute(final Path file, final String view, final String attribute,
-						final Object value, final LinkOption... options) throws IOException {
-					throw new UnsupportedOperationException("setFileAttribute Disabled");
-				}
+		public void setFileAttribute(final ServerSession session, final SftpSubsystemProxy subsystem, final Path file,
+				final String view, final String attribute, final Object value, final LinkOption... options)
+				throws IOException {
+			throw new UnsupportedOperationException("Attribute set not supported for " + file);
+		}
 
-				@Override
-				protected void createLink(final int id, final String targetPath, final String linkPath,
-						final boolean symLink) throws IOException {
-					throw new UnsupportedOperationException("createLink Disabled");
-				}
-			};
-			final Collection<? extends SftpEventListener> listeners = getRegisteredListeners();
-			if (GenericUtils.size(listeners) > 0) {
-				for (final SftpEventListener l : listeners) {
-					subsystem.addSftpEventListener(l);
-				}
-			}
-			return subsystem;
+		@Override
+		public void setFileOwner(final ServerSession session, final SftpSubsystemProxy subsystem, final Path file,
+				final Principal value, final LinkOption... options) throws IOException {
+			throw new UnsupportedOperationException("Owner set not supported for " + file);
+		}
+
+		@Override
+		public void setGroupOwner(final ServerSession session, final SftpSubsystemProxy subsystem, final Path file,
+				final Principal value, final LinkOption... options) throws IOException {
+			throw new UnsupportedOperationException("Group set not supported");
+		}
+
+		@Override
+		public void setFilePermissions(final ServerSession session, final SftpSubsystemProxy subsystem, final Path file,
+				final Set<PosixFilePermission> perms, final LinkOption... options) throws IOException {
+			throw new UnsupportedOperationException("Permissions set not supported");
+		}
+
+		@Override
+		public void setFileAccessControl(final ServerSession session, final SftpSubsystemProxy subsystem,
+				final Path file, final List<AclEntry> acl, final LinkOption... options) throws IOException {
+			throw new UnsupportedOperationException("ACL set not supported");
+		}
+
+		@Override
+		public void createLink(final ServerSession session, final SftpSubsystemProxy subsystem, final Path link,
+				final Path existing, final boolean symLink) throws IOException {
+			throw new UnsupportedOperationException("Link not supported");
+		}
+
+		@Override
+		public String toString() {
+			return SftpFileSystemAccessor.class.getSimpleName() + "[CUSTOM]";
 		}
 	}
 
@@ -552,7 +756,7 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 		}
 
 		@Override
-		public FileSystem createFileSystem(final Session session) throws IOException {
+		public FileSystem createFileSystem(final SessionContext session) throws IOException {
 			final String userName = session.getUsername();
 			final String home = db.getHome(userName);
 			if (home == null) {
@@ -562,68 +766,15 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 					: new ReadOnlyRootedFileSystemProvider();
 			return rfsp.newFileSystem(Paths.get(home), Collections.<String, Object>emptyMap());
 		}
-	}
 
-	// =================== PublicKeyHelper
-
-	static class PublicKeyHelper {
-		private static final Charset US_ASCII = Charset.forName("US-ASCII");
-
-		public static String getEncodedPublicKey(final PublicKey pub) {
-			if (pub instanceof RSAPublicKey) {
-				return encodeRSAPublicKey((RSAPublicKey) pub);
+		@Override
+		public Path getUserHomeDir(final SessionContext session) throws IOException {
+			final String userName = session.getUsername();
+			final String home = db.getHome(userName);
+			if (home == null) {
+				throw new IOException("user home error");
 			}
-			if (pub instanceof DSAPublicKey) {
-				return encodeDSAPublicKey((DSAPublicKey) pub);
-			}
-			return null;
+			return Paths.get(home);
 		}
-
-		public static String encodeRSAPublicKey(final RSAPublicKey key) {
-			final BigInteger[] params = new BigInteger[] {
-					key.getPublicExponent(), key.getModulus()
-			};
-			return encodePublicKey(params, "ssh-rsa");
-		}
-
-		public static String encodeDSAPublicKey(final DSAPublicKey key) {
-			final BigInteger[] params = new BigInteger[] {
-					key.getParams().getP(), key.getParams().getQ(), key.getParams().getG(), key.getY()
-			};
-			return encodePublicKey(params, "ssh-dss");
-		}
-
-		private static final void encodeUInt32(final IoBuffer bab, final int value) {
-			bab.put((byte) ((value >> 24) & 0xFF));
-			bab.put((byte) ((value >> 16) & 0xFF));
-			bab.put((byte) ((value >> 8) & 0xFF));
-			bab.put((byte) (value & 0xFF));
-		}
-
-		private static String encodePublicKey(final BigInteger[] params, final String keyType) {
-			final IoBuffer bab = IoBuffer.allocate(256);
-			bab.setAutoExpand(true);
-			byte[] buf = null;
-			// encode the header "ssh-dss" / "ssh-rsa"
-			buf = keyType.getBytes(US_ASCII); // RFC-4253, pag.13
-			encodeUInt32(bab, buf.length);    // RFC-4251, pag.8 (string encoding)
-			for (final byte b : buf) {
-				bab.put(b);
-			}
-			// encode params
-			for (final BigInteger param : params) {
-				buf = param.toByteArray();
-				encodeUInt32(bab, buf.length);
-				for (final byte b : buf) {
-					bab.put(b);
-				}
-			}
-			bab.flip();
-			buf = new byte[bab.limit()];
-			System.arraycopy(bab.array(), 0, buf, 0, buf.length);
-			bab.free();
-			return keyType + " " + DatatypeConverter.printBase64Binary(buf);
-		}
-
 	}
 }

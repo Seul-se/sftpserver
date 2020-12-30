@@ -3,14 +3,15 @@
 //
 // This file contains a default set of security policies to be enforced by JVM
 //
-// $Id: sftpd.policy,v 1.02 2018/01/27 00:46:00 ggrandes Exp $
+// $Id: sftpd.policy,v 1.3.0 2020/06/21 19:45:00 ggrandes Exp $
 // ============================================================================
 //
 // Load with: -Djava.security.manager -Djava.security.policy=sftpd.policy
 //
 // Troubleshooting: -Djava.security.debug=access:failure 
-// http://docs.oracle.com/javase/1.5.0/docs/guide/plugin/developer_guide/debugger.html
-// https://docs.oracle.com/javase/7/docs/technotes/guides/security/permissions.html
+// https://docs.oracle.com/javase/8/docs/technotes/guides/security/troubleshooting-security.html
+// https://docs.oracle.com/javase/8/docs/technotes/guides/security/permissions.html
+// https://docs.oracle.com/javase/8/docs/technotes/guides/security/PolicyFiles.html
 //
 grant {
   //
@@ -26,6 +27,8 @@ grant {
   permission java.util.PropertyPermission "user.dir", "read";
   permission java.util.PropertyPermission "user.name", "read";  
   permission java.util.PropertyPermission "user.home", "read";  
+  // org.apache.sshd.common.SyspropsMapWrapper
+  permission java.util.PropertyPermission "*", "read, write";
   //
   permission java.lang.RuntimePermission "shutdownHooks";
   permission java.lang.RuntimePermission "modifyThread";
@@ -33,9 +36,12 @@ grant {
   permission java.lang.RuntimePermission "writeFileDescriptor";
   permission java.lang.RuntimePermission "accessUserInformation";
   permission java.lang.RuntimePermission "fileSystemProvider";
+  permission java.lang.RuntimePermission "accessDeclaredMembers";
   //
   permission java.security.SecurityPermission "putProviderProperty.BC";
   permission java.security.SecurityPermission "insertProvider.BC";
+  permission java.security.SecurityPermission "putProviderProperty.EdDSA";
+  permission java.security.SecurityPermission "insertProvider.EdDSA";
   //
   permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
   //
@@ -46,6 +52,7 @@ grant {
   permission java.io.FilePermission "${java.io.tmpdir}${/}-", "read, write, delete";
   //
   permission java.io.FilePermission "/etc/resolv.conf", "read";
+  permission java.io.FilePermission "/etc/ssh/moduli", "read";
   permission java.io.FilePermission "${sftp.home}/-", "read";
   permission java.io.FilePermission "${sftp.home}/keys/hostkey.ser", "read, write";
   permission java.io.FilePermission "${sftp.home}/keys/hostkey.pem", "read, write";
