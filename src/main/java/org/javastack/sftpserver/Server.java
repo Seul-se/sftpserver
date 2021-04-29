@@ -21,6 +21,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.file.FileSystem;
 import java.nio.file.LinkOption;
@@ -28,6 +30,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.attribute.AclEntry;
 import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.spi.FileSystemProvider;
 import java.security.Principal;
 import java.security.PublicKey;
 import java.util.Arrays;
@@ -50,10 +53,13 @@ import org.apache.sshd.common.config.keys.PublicKeyEntry;
 import org.apache.sshd.common.file.FileSystemFactory;
 import org.apache.sshd.common.file.root.RootedFileSystemProvider;
 import org.apache.sshd.common.kex.BuiltinDHFactories;
+import org.apache.sshd.common.keyprovider.FileKeyPairProvider;
+import org.apache.sshd.common.keyprovider.KeyPairProvider;
 import org.apache.sshd.common.mac.BuiltinMacs;
 import org.apache.sshd.common.session.SessionContext;
 import org.apache.sshd.common.session.SessionHeartbeatController.HeartbeatType;
 import org.apache.sshd.common.util.security.SecurityUtils;
+import org.apache.sshd.common.util.security.bouncycastle.BouncyCastleGeneratorHostKeyProvider;
 import org.apache.sshd.server.Environment;
 import org.apache.sshd.server.ExitCallback;
 import org.apache.sshd.server.ServerBuilder;
@@ -74,6 +80,7 @@ import org.apache.sshd.server.shell.ShellFactory;
 import org.apache.sshd.server.subsystem.sftp.SftpFileSystemAccessor;
 import org.apache.sshd.server.subsystem.sftp.SftpSubsystemFactory;
 import org.apache.sshd.server.subsystem.sftp.SftpSubsystemProxy;
+import org.javastack.sftpserver.keeper.ServerStatus;
 import org.javastack.sftpserver.readonly.ReadOnlyRootedFileSystemProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -96,9 +103,13 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 	private ServiceLogger logger;
 	private volatile boolean running = true;
 
-	public static void main(final String[] args) {
-		new Server().start();
+	public ServerStatus getServerStatus() {
+		return serverStatus;
 	}
+
+	private ServerStatus serverStatus = new ServerStatus();
+
+
 
 	protected void setupFactories() {
 		final SftpSubsystemFactory sftpSubsys = new SftpSubsystemFactory.Builder()
@@ -126,13 +137,20 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 	}
 
 	protected void setupKeyPair() {
-		final AbstractGeneratorHostKeyProvider provider;
-		if (SecurityUtils.isBouncyCastleRegistered()) {
-			provider = SecurityUtils.createGeneratorHostKeyProvider(Paths.get(HOSTKEY_FILE_PEM));
-		} else {
-			provider = new SimpleGeneratorHostKeyProvider(Paths.get(HOSTKEY_FILE_SER));
+//		final KeyPairProvider provider;
+//		if (SecurityUtils.isBouncyCastleRegistered()) {
+//			provider = SecurityUtils.createGeneratorHostKeyProvider(Paths.get(HOSTKEY_FILE_PEM));
+
+		KeyPairProvider provider = null;
+		try {
+			provider = new FileKeyPairProvider(Paths.get(getClass().getClassLoader().getResource("hostkey.pem").toURI()));
+		} catch (URISyntaxException e) {
+			e.printStackTrace();
 		}
-		provider.setAlgorithm(KeyUtils.RSA_ALGORITHM);
+//		} else {
+//			provider = new SimpleGeneratorHostKeyProvider(Paths.get(HOSTKEY_FILE_SER));
+//		}
+//		provider.setAlgorithm(KeyUtils.RSA_ALGORITHM);
 		sshd.setKeyPairProvider(provider);
 	}
 
@@ -256,7 +274,6 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 	 *      diffie-hellman-group-exchange-sha1
 	 * @see org.apache.sshd.server.kex.DHGEXServer
 	 * @see org.apache.sshd.server.kex.Moduli
-	 * @see http://manpages.ubuntu.com/manpages/focal/man5/moduli.5.html
 	 */
 	private void hackModuliDHGEX() {
 		URL srcModuli = null;
@@ -298,7 +315,7 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 
 	public void start() {
 		LOG.info("Starting");
-		logger = new ServiceLogger();
+		logger = new ServiceLogger(this);
 		db = loadConfig();
 		LOG.info("BouncyCastle enabled=" + SecurityUtils.isBouncyCastleRegistered());
 		sshd = SshServer.setUpDefaultServer();
@@ -765,6 +782,12 @@ public class Server implements PasswordAuthenticator, PublickeyAuthenticator {
 			final RootedFileSystemProvider rfsp = db.hasWritePerm(userName) ? new RootedFileSystemProvider()
 					: new ReadOnlyRootedFileSystemProvider();
 			return rfsp.newFileSystem(Paths.get(home), Collections.<String, Object>emptyMap());
+//			final HadoopFileSystemProvider rfsp = new HadoopFileSystemProvider();
+//			try {
+//				return rfsp.newFileSystem(new URI("hdfs://47.94.243.153:8580/"), Collections.<String, Object>emptyMap());
+//			} catch (URISyntaxException e) {
+//				throw new IOException(e);
+//			}
 		}
 
 		@Override

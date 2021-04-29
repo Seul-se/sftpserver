@@ -6,24 +6,29 @@ import java.net.SocketAddress;
 import java.nio.file.CopyOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.security.PublicKey;
-import java.util.Collection;
-import java.util.Map;
+import java.util.*;
 
 import org.apache.sshd.common.io.IoSession;
 import org.apache.sshd.common.session.Session;
 import org.apache.sshd.common.session.SessionListener;
 import org.apache.sshd.common.util.logging.AbstractLoggingBean;
 import org.apache.sshd.server.session.ServerSession;
+import org.apache.sshd.server.subsystem.sftp.FileHandle;
 import org.apache.sshd.server.subsystem.sftp.Handle;
 import org.apache.sshd.server.subsystem.sftp.SftpEventListener;
+import org.javastack.sftpserver.keeper.ConnectionInfo;
 import org.slf4j.event.Level;
 
 public class ServiceLogger extends AbstractLoggingBean implements SftpEventListener, SessionListener {
 	private boolean logRequest = false;
 
-	ServiceLogger() {
+	private Server server;
+
+	ServiceLogger(Server server) {
 		super();
+		this.server = server;
 	}
 
 	public void setLogRequest(final boolean logRequest) {
@@ -81,16 +86,39 @@ public class ServiceLogger extends AbstractLoggingBean implements SftpEventListe
 
 	public void authPasswordPostLogin(final ServerSession session, final String username, final Level level,
 			final String info) {
+		Connected(session,username);
 		logLevel("auth password(" + toHuman(session, username) + ") info: " + info, level);
 	}
 
 	public void authPublicKeyPostLogin(final ServerSession session, final String username, final PublicKey key,
 			final Level level, final String info) {
+		Connected(session,username);
 		final String keyType = (key == null ? "<unknown>" : key.getAlgorithm());
 		logLevel("auth publickey(" + toHuman(session, username) + ") type: " + keyType //
 				+ " info: " + info, level);
 	}
 
+	private void Connected(final ServerSession session,String username){
+		String sourceIP = ((InetSocketAddress)session.getClientAddress()).getHostString();
+		int sourcePort = ((InetSocketAddress)session.getClientAddress()).getPort();
+		Map<String, List<ConnectionInfo>> allConnection = server.getServerStatus().getAllConnection();
+		List<ConnectionInfo> connectionInfos = allConnection.get(username);
+		if(connectionInfos == null){
+			synchronized (allConnection){
+				connectionInfos = allConnection.get(username);
+				if(connectionInfos == null){
+					connectionInfos = new Vector<>();
+					allConnection.put(username,connectionInfos);
+				}
+			}
+		}
+		ConnectionInfo connectionInfo = new ConnectionInfo();
+		connectionInfo.setCreateTime(new Date());
+		connectionInfo.setSourceIp(sourceIP);
+		connectionInfo.setSourcePort(sourcePort);
+		connectionInfo.setUserName(username);
+		connectionInfos.add(connectionInfo);
+	}
 	// Session Logger
 
 	@Override
@@ -117,6 +145,7 @@ public class ServiceLogger extends AbstractLoggingBean implements SftpEventListe
 
 	// Request Logger
 
+	//建立channel
 	@Override
 	public void initialized(final ServerSession session, final int version) {
 		if (log.isInfoEnabled()) {
@@ -124,6 +153,7 @@ public class ServiceLogger extends AbstractLoggingBean implements SftpEventListe
 		}
 	}
 
+	//断开channel
 	@Override
 	public void destroying(final ServerSession session) {
 		if (log.isInfoEnabled()) {
@@ -131,9 +161,19 @@ public class ServiceLogger extends AbstractLoggingBean implements SftpEventListe
 		}
 	}
 
+	//上传文件
 	@Override
 	public void opening(final ServerSession session, final String remoteHandle, final Handle localHandle)
 			throws IOException {
+		if(localHandle instanceof FileHandle) {
+			FileHandle fh = (FileHandle) localHandle;
+			if (fh.getOpenOptions().contains(StandardOpenOption.READ)) {
+				//TODO 下载文件
+			}
+			if (fh.getOpenOptions().contains(StandardOpenOption.WRITE)) {
+				//TODO 上传/修改 文件
+			}
+		}
 		if (!logRequest)
 			return;
 		if (log.isInfoEnabled()) {
@@ -145,6 +185,15 @@ public class ServiceLogger extends AbstractLoggingBean implements SftpEventListe
 
 	@Override
 	public void closing(final ServerSession session, final String remoteHandle, final Handle localHandle) {
+		if(localHandle instanceof FileHandle) {
+			FileHandle fh = (FileHandle) localHandle;
+			if (fh.getOpenOptions().contains(StandardOpenOption.READ)) {
+				//TODO 下载完成
+			}
+			if (fh.getOpenOptions().contains(StandardOpenOption.WRITE)) {
+				//TODO 上传/修改 完成
+			}
+		}
 		if (!logRequest)
 			return;
 		if (log.isInfoEnabled()) {
